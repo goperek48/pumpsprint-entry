@@ -66,54 +66,103 @@ SCALE_IN_MAX_LAMPORTS = 100_000_000  # never add more than 0.10 SOL to one coin
 MAX_SLIPPAGE_BPS = 500     # a fill may land at most 5% worse than the quote
 
 
-class Position:
+class Trade:
     """One live trade, as the bot remembers it."""
 
-    __slots__ = ("entry_price", "peak_price", "entry_slot", "stake", "scaled_in")
+    __slots__ = ("entry", "peak", "opened", "size", "topped")
 
-    def __init__(self, entry_price, entry_slot, stake):
-        self.entry_price = entry_price
-        self.peak_price = entry_price
-        self.entry_slot = entry_slot
-        self.stake = stake          # lamports the first buy cost
-        self.scaled_in = False      # the one pyramid add is still unused
+    def __init__(self, entry, opened, size):
+        self.entry = entry          # quote per token paid on the first buy
+        self.peak = entry           # best quote per token seen since entry
+        self.opened = opened        # slot the first buy was decided on
+        self.size = size            # lamports the first buy cost
+        self.topped = False         # the one pyramid add is still unused
 
 
 class Bot:
-    """Buys each gentle starter once, exits fast, never holds more than five."""
+    """Buys each quiet launcher once, exits fast, never holds more than five."""
 
     def __init__(self):
-        # mint -> price at birth (quote per token on the CreateEvent)
-        self.birth = {}
+        # mint -> launch price (quote per token on the CreateEvent)
+        self.launch_price = {}
         # mint -> slot its CreateEvent landed in
-        self.born_slot = {}
+        self.born = {}
         # mints bought once already (a dumped coin gets no second entry)
-        self.bought = set()
-        # mint -> Position for the trades still open
-        self.open = {}
+        self.done = set()
+        # mint -> Trade for the positions still open
+        self.live = {}
 
     def on_batch(self, state, batch):
-        # Note the batch's births on the per-coin tape, then decide.
+        self._note_launches(batch)
+        orders = []
+        orders += self._close_out(state)
+        orders += self._top_up(state)
+        orders += self._open_new(state, batch)
+        return orders
+
+    def _note_launches(self, batch):
+        """Record the launch price of every coin born in this batch."""
         for e in batch["events"]:
             if e["event"] != "CreateEvent":
                 continue
             mint = e["mint"]
-            # Take the birth price from the event itself: the curve in
+            # Take the launch price from the event itself: the curve in
             # state already includes every trade in this batch, so reading
-            # it here would price the birth after the first trades of the
+            # it here would price the launch after the first trades of the
             # same slot, not at creation.
             vt = int(e.get("virtual_token_reserves") or 0)
             vq = int(e.get("virtual_quote_reserves") or 0)
             if vt > 0 and vq > 0:
-                self.birth[mint] = vq / vt
-                self.born_slot[mint] = e["slot"]
+                self.launch_price[mint] = vq / vt
+                self.born[mint] = e["slot"]
+
+    @staticmethod
+    def _quote(curve):
+        """A curve's current price in quote lamports per token, or None."""
+        if curve.virtual_token_reserves <= 0:
+            return None
+        return curve.virtual_quote_reserves / curve.virtual_token_reserves
+
+    def _close_out(self, state):
+        """Sell every open trade whose exit rule has tripped."""
         orders = []
-        orders.extend(self._exits(state))
-        orders.extend(self._scale_ins(state))
-        orders.extend(self._entries(state, batch))
+        for mint, trade in list(self.live.items()):
+            holding = state.positions.get(mint)
+            if holding is None or holding.token_amount <= 0:
+                # Nothing left to sell (already closed by the house or
+                # sold): drop it from the book.
+                del self.live[mint]
+                continue
+            curve = state.curves.get(mint)
+            if curve is None or curve.complete:
+                # A finished curve refuses sell orders and the house
+                # closes it on its own. Drop it from the book.
+                if curve is not None and curve.complete:
+                    del self.live[mint]
+                continue
+            price = self._quote(curve)
+            if price is None:
+                continue
+            if price > trade.peak:
+                trade.peak = price
+            if (
+                price >= trade.entry * TAKE_PROFIT_MULT
+                or price <= trade.entry * STOP_LOSS_MULT
+                or price <= trade.peak * TRAIL_MULT
+                or state.slot - trade.opened >= MAX_HOLD_SLOTS
+            ):
+                orders.append(
+                    {
+                        "side": "sell",
+                        "mint": mint,
+                        "token_amount": holding.token_amount,
+                        "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                    }
+                )
+                del self.live[mint]
         return orders
 
-    def _scale_ins(self, state):
+    def _top_up(self, state):
         """Top up the winners, once each. The add goes out only when the
         coin has already shown it can climb (+20%) and the cap has grown
         wide enough for a worthwhile top-up. The extra lamports ride only
@@ -124,16 +173,16 @@ class Bot:
         caps = state.hello["caps"]
         tx = state.tx_fee_lamports()
         free = state.free_cash_lamports()
-        for mint, pos in list(self.open.items()):
-            if pos.scaled_in:
+        for mint, trade in list(self.live.items()):
+            if trade.topped:
                 continue
             if len(orders) + len(state.pending) >= caps["max_orders_per_batch"]:
                 break
             curve = state.curves.get(mint)
             if curve is None or curve.complete:
                 continue
-            price = self._price(curve)
-            if price is None or price < pos.entry_price * SCALE_IN_MULT:
+            price = self._quote(curve)
+            if price is None or price < trade.entry * SCALE_IN_MULT:
                 continue
             cap = state.max_buy_lamports(mint)
             if cap < SCALE_IN_MIN_CAP:
@@ -152,81 +201,38 @@ class Bot:
             # Average the entry price across both stakes, so the exit
             # rules keep measuring the full position against what it
             # really cost.
-            pos.entry_price = (
-                pos.entry_price * pos.stake + price * add
-            ) / (pos.stake + add)
-            pos.stake += add
-            pos.scaled_in = True
+            trade.entry = (trade.entry * trade.size + price * add) / (trade.size + add)
+            trade.size += add
+            trade.topped = True
             free -= add + tx
         return orders
 
-    def _exits(self, state):
-        """Close out every open trade whose exit rule has tripped."""
-        orders = []
-        for mint, pos in list(self.open.items()):
-            holding = state.positions.get(mint)
-            if holding is None or holding.token_amount <= 0:
-                # Nothing left to sell (already closed by the house or
-                # sold): drop it from the book.
-                del self.open[mint]
-                continue
-            curve = state.curves.get(mint)
-            if curve is None or curve.complete:
-                # A finished curve refuses sell orders and the house
-                # closes it on its own. Drop it from the book.
-                if curve is not None and curve.complete:
-                    del self.open[mint]
-                continue
-            price = self._price(curve)
-            if price is None:
-                continue
-            if price > pos.peak_price:
-                pos.peak_price = price
-            if (
-                price >= pos.entry_price * TAKE_PROFIT_MULT
-                or price <= pos.entry_price * STOP_LOSS_MULT
-                or price <= pos.peak_price * TRAIL_MULT
-                or state.slot - pos.entry_slot >= MAX_HOLD_SLOTS
-            ):
-                orders.append(self._sell(mint, holding.token_amount))
-                del self.open[mint]
-        return orders
-
-    @staticmethod
-    def _sell(mint, token_amount):
-        return {
-            "side": "sell",
-            "mint": mint,
-            "token_amount": token_amount,
-            "max_slippage_bps": MAX_SLIPPAGE_BPS,
-        }
-
-    def _entries(self, state, batch):
+    def _open_new(self, state, batch):
         """First buys on fresh coins whose opening surge is still modest."""
         orders = []
         caps = state.hello["caps"]
         tx = state.tx_fee_lamports()
         free = state.free_cash_lamports()
-        slots = caps["max_open_positions"] - state.committed_position_count()
-        if slots <= 0:
+        room = caps["max_open_positions"] - state.committed_position_count()
+        if room <= 0:
             return orders
         for e in batch["events"]:
             if len(orders) + len(state.pending) >= caps["max_orders_per_batch"]:
                 break
             mint = e["mint"]
-            if mint in self.bought or mint in self.open:
+            if mint in self.done or mint in self.live:
                 continue
-            if mint not in self.birth:
+            if mint not in self.launch_price:
                 continue
-            if state.slot - self.born_slot.get(mint, state.slot) > ENTRY_WINDOW_SLOTS:
+            if state.slot - self.born.get(mint, state.slot) > ENTRY_WINDOW_SLOTS:
                 continue
             curve = state.curves.get(mint)
             if curve is None or curve.complete:
                 continue
-            price = self._price(curve)
-            if price is None or price < self.birth[mint] * ENTRY_MIN_MULT:
+            price = self._quote(curve)
+            if price is None or price < self.launch_price[mint] * ENTRY_MIN_MULT:
                 continue
-            if price > self.birth[mint] * ENTRY_MAX_MULT:
+            if price > self.launch_price[mint] * ENTRY_MAX_MULT:
                 # Surge too far already: the move is exhausted. Wait for a
                 # dip back inside the window instead of chasing the top.
                 continue
@@ -234,7 +240,7 @@ class Bot:
             if cap < MIN_STAKE_LAMPORTS:
                 continue
             stake = min(cap, MAX_STAKE_LAMPORTS)
-            if slots <= 0 or free < stake + tx:
+            if room <= 0 or free < stake + tx:
                 continue
             orders.append(
                 {
@@ -244,18 +250,11 @@ class Bot:
                     "max_slippage_bps": MAX_SLIPPAGE_BPS,
                 }
             )
-            self.bought.add(mint)
-            self.open[mint] = Position(price, state.slot, stake)
+            self.done.add(mint)
+            self.live[mint] = Trade(price, state.slot, stake)
             free -= stake + tx
-            slots -= 1
+            room -= 1
         return orders
-
-    @staticmethod
-    def _price(curve):
-        """A curve's current price in quote lamports per token, or None."""
-        if curve.virtual_token_reserves <= 0:
-            return None
-        return curve.virtual_quote_reserves / curve.virtual_token_reserves
 
 
 def main():
